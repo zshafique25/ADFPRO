@@ -34,14 +34,6 @@
 		"ls_datalake_properties_typeProperties_url": {
 			"type": "string",
 			"defaultValue": "https://dfprostorage.dfs.core.windows.net/"
-		},
-		"schedule_properties_Scheduled_parameters_schema": {
-			"type": "string",
-			"defaultValue": "source"
-		},
-		"schedule_properties_Scheduled_parameters_table": {
-			"type": "string",
-			"defaultValue": "Orders"
 		}
 	},
 	"variables": {
@@ -1791,52 +1783,102 @@
 			]
 		},
 		{
-			"name": "[concat(parameters('factoryName'), '/Scheduled')]",
+			"name": "[concat(parameters('factoryName'), '/deltaflow')]",
+			"type": "Microsoft.DataFactory/factories/dataflows",
+			"apiVersion": "2018-06-01",
+			"properties": {
+				"type": "MappingDataFlow",
+				"typeProperties": {
+					"sources": [
+						{
+							"dataset": {
+								"referenceName": "ds_csv_dynamic",
+								"type": "DatasetReference"
+							},
+							"name": "source"
+						}
+					],
+					"sinks": [
+						{
+							"linkedService": {
+								"referenceName": "ls_datalake",
+								"type": "LinkedServiceReference"
+							},
+							"name": "sinkDelta"
+						}
+					],
+					"transformations": [
+						{
+							"name": "UpperState"
+						},
+						{
+							"name": "selectCols"
+						},
+						{
+							"name": "alterRow"
+						}
+					],
+					"scriptLines": [
+						"source(output(",
+						"          location_id as short,",
+						"          city as string,",
+						"          state as string,",
+						"          country as string,",
+						"          latitude as double,",
+						"          longitude as double,",
+						"          last_updated_timestamp as timestamp",
+						"     ),",
+						"     allowSchemaDrift: true,",
+						"     validateSchema: false,",
+						"     ignoreNoFilesFound: false) ~> source",
+						"source derive(state = upper(state)) ~> UpperState",
+						"UpperState select(mapColumn(",
+						"          location_id,",
+						"          city,",
+						"          state,",
+						"          country,",
+						"          last_updated_timestamp",
+						"     ),",
+						"     skipDuplicateMapInputs: true,",
+						"     skipDuplicateMapOutputs: true) ~> selectCols",
+						"selectCols alterRow(upsertIf(1==1)) ~> alterRow",
+						"alterRow sink(allowSchemaDrift: true,",
+						"     validateSchema: false,",
+						"     format: 'delta',",
+						"     fileSystem: 'sink',",
+						"     folderPath: 'deltasink',",
+						"     mergeSchema: false,",
+						"     autoCompact: false,",
+						"     optimizedWrite: false,",
+						"     vacuum: 0,",
+						"     deletable: false,",
+						"     insertable: true,",
+						"     updateable: false,",
+						"     upsertable: true,",
+						"     keys:['location_id'],",
+						"     umask: 0022,",
+						"     preCommands: [],",
+						"     postCommands: [],",
+						"     skipDuplicateMapInputs: true,",
+						"     skipDuplicateMapOutputs: true) ~> sinkDelta"
+					]
+				}
+			},
+			"dependsOn": [
+				"[concat(variables('factoryId'), '/datasets/ds_csv_dynamic')]",
+				"[concat(variables('factoryId'), '/linkedServices/ls_datalake')]"
+			]
+		},
+		{
+			"name": "[concat(parameters('factoryName'), '/Deltalake')]",
 			"type": "Microsoft.DataFactory/factories/pipelines",
 			"apiVersion": "2018-06-01",
 			"properties": {
 				"activities": [
 					{
-						"name": "Execute Pipeline1",
-						"type": "ExecutePipeline",
+						"name": "Data flow",
+						"type": "ExecuteDataFlow",
 						"dependsOn": [],
-						"policy": {
-							"secureInput": false
-						},
-						"userProperties": [],
-						"typeProperties": {
-							"pipeline": {
-								"referenceName": "Ingestion",
-								"type": "PipelineReference"
-							},
-							"waitOnCompletion": true,
-							"parameters": {
-								"schema": {
-									"value": "@pipeline().parameters.schema",
-									"type": "Expression"
-								},
-								"table": {
-									"value": "@pipeline().parameters.table",
-									"type": "Expression"
-								},
-								"backdate": {
-									"value": "@pipeline().parameters.backdate",
-									"type": "Expression"
-								}
-							}
-						}
-					},
-					{
-						"name": "Alerts",
-						"type": "WebActivity",
-						"dependsOn": [
-							{
-								"activity": "Execute Pipeline1",
-								"dependencyConditions": [
-									"Failed"
-								]
-							}
-						],
 						"policy": {
 							"timeout": "0.12:00:00",
 							"retry": 0,
@@ -1846,15 +1888,27 @@
 						},
 						"userProperties": [],
 						"typeProperties": {
-							"method": "POST",
-							"headers": {},
-							"url": {
-								"value": "https://prod-12.centralindia.logic.azure.com:443/workflows/c5d6dcdfe18448ba94cec8e1a50e82f4/triggers/When_an_HTTP_request_is_received/paths/invoke?api-version=2016-10-01&sp=%2Ftriggers%2FWhen_an_HTTP_request_is_received%2Frun&sv=1.0&sig=2agvdsjRVPBe02h-bCqEiEWa3J9eOPKX1lqSvo8GUss",
-								"type": "Expression"
+							"dataflow": {
+								"referenceName": "deltaflow",
+								"type": "DataFlowReference",
+								"parameters": {},
+								"datasetParameters": {
+									"source": {
+										"p_container": "source",
+										"p_folder": "Deltasource",
+										"p_file": "locations.csv"
+									},
+									"sinkDelta": {}
+								}
 							},
-							"body": {
-								"value": "{\n    \"pipeline name\" : \"@{pipeline().Pipeline}\",\n    \"pipeline runid\" : \"@{pipeline().RunId}\"\n}",
-								"type": "Expression"
+							"staging": {},
+							"compute": {
+								"coreCount": 8,
+								"computeType": "General"
+							},
+							"traceLevel": "None",
+							"cacheSinks": {
+								"firstRowOnly": true
 							}
 						}
 					}
@@ -1862,58 +1916,10 @@
 				"policy": {
 					"elapsedTimeMetric": {}
 				},
-				"parameters": {
-					"schema": {
-						"type": "string",
-						"defaultValue": "source"
-					},
-					"table": {
-						"type": "string",
-						"defaultValue": "Orders"
-					},
-					"backdate": {
-						"type": "string",
-						"defaultValue": "''"
-					}
-				},
-				"annotations": [],
-				"lastPublishTime": "2026-07-20T08:17:57Z"
+				"annotations": []
 			},
 			"dependsOn": [
-				"[concat(variables('factoryId'), '/pipelines/Ingestion')]"
-			]
-		},
-		{
-			"name": "[concat(parameters('factoryName'), '/schedule')]",
-			"type": "Microsoft.DataFactory/factories/triggers",
-			"apiVersion": "2018-06-01",
-			"properties": {
-				"annotations": [],
-				"runtimeState": "Stopped",
-				"pipelines": [
-					{
-						"pipelineReference": {
-							"referenceName": "Scheduled",
-							"type": "PipelineReference"
-						},
-						"parameters": {
-							"schema": "[parameters('schedule_properties_Scheduled_parameters_schema')]",
-							"table": "[parameters('schedule_properties_Scheduled_parameters_table')]"
-						}
-					}
-				],
-				"type": "ScheduleTrigger",
-				"typeProperties": {
-					"recurrence": {
-						"frequency": "Day",
-						"interval": 1,
-						"startTime": "2026-07-20T08:01:00",
-						"timeZone": "Pakistan Standard Time"
-					}
-				}
-			},
-			"dependsOn": [
-				"[concat(variables('factoryId'), '/pipelines/Scheduled')]"
+				"[concat(variables('factoryId'), '/dataflows/deltaflow')]"
 			]
 		}
 	]
