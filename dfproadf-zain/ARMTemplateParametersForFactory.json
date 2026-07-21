@@ -1,0 +1,36 @@
+{
+	"$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentParameters.json#",
+	"contentVersion": "1.0.0.0",
+	"parameters": {
+		"factoryName": {
+			"value": "dfproadf-zain"
+		},
+		"ls_database_password": {
+			"value": ""
+		},
+		"ls_datalake_accountKey": {
+			"value": ""
+		},
+		"ls_Rest_properties_typeProperties_url": {
+			"value": "https://pokeapi.co/api/v2/pokemon"
+		},
+		"ls_database_properties_typeProperties_server": {
+			"value": "dfproserver-zain.database.windows.net"
+		},
+		"ls_database_properties_typeProperties_database": {
+			"value": "dfprodb"
+		},
+		"ls_database_properties_typeProperties_userName": {
+			"value": "admin-zain"
+		},
+		"ls_datalake_properties_typeProperties_url": {
+			"value": "https://dfprostorage.dfs.core.windows.net/"
+		},
+		"schedule_properties_Scheduled_parameters_schema": {
+			"value": "source"
+		},
+		"schedule_properties_Scheduled_parameters_table": {
+			"value": "Orders"
+		}
+	}
+}
