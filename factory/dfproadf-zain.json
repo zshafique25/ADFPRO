@@ -1,0 +1,15 @@
+{
+	"name": "dfproadf-zain",
+	"properties": {
+		"trustModeClaimForMi": {
+			"value": "Disabled",
+			"editable": true
+		}
+	},
+	"location": "centralindia",
+	"identity": {
+		"type": "SystemAssigned",
+		"principalId": "057e2e7c-28f9-4f94-bcc0-24b39a4fd86f",
+		"tenantId": "d56bf38d-1ed4-4467-a647-4711adc68974"
+	}
+}
