@@ -187,4 +187,99 @@ Use this approach when the API does **not** return a next-page URL, so you have 
 - The offset approach depends on knowing the total item count (`count`) up front from a single probe call (`Endpoint`) — if the API doesn't expose a total count either, the range would need a hardcoded or otherwise-derived upper bound.
 - This is a manual/on-demand pull (not scheduled) and pulls the full dataset from scratch each run — it does **not** implement incremental/CDC-style loading. For very large or frequently-changing datasets (millions of rows), a real-time/incremental design is more appropriate; this pattern is meant for pulling a full reference/lookup dataset such as a paginated public API listing.
 - Pagination behavior is API-specific — always check the target API's docs to see whether it returns a next-page link (`AbsoluteUrl`) or expects the caller to compute paging (`offset`/`limit`, `page`, cursor tokens, etc.) before picking a rule.
-- 
+
+# Router Pipeline — Route Files to Destination Folders by Filename
+ 
+Watches for a small "flag" file, then scans a source folder and routes every file it finds into the correct destination folder based on the file's name (e.g. `customers.csv` → `sink/customers/`, `drivers.csv` → `sink/drivers/`, `trips.csv` → `sink/trips/`). Built as a lightweight alternative to a Storage Event trigger.
+ 
+## Architecture
+ 
+```
+Validate ──▶ Get Metadata ──▶ ForEachFile ──▶ Delete
+                                  └─ SwitchFile (per item)
+                                       ├─ customers ─▶ Copy Customers
+                                       ├─ drivers   ─▶ Copy Drivers
+                                       └─ trips     ─▶ Copy Trips
+```
+ 
+**Why this shape**: Storage Event triggers aren't available on every subscription tier and add cost, so this pipeline polls instead — it waits for a flag file to appear, then does the routing work, then deletes the flag file so the next run starts clean.
+<img width="1291" height="347" alt="Router" src="https://github.com/user-attachments/assets/29f4e4ea-975d-45ac-95a1-d3bad6b3330b" />
+<img width="257" height="610" alt="Router1" src="https://github.com/user-attachments/assets/d74d25ba-0917-482d-8e28-0168d45bfb93" />
+
+---
+ 
+## Step 1: `Validate` (Validation Activity)
+ 
+Polls for a specific flag file before anything else runs.
+ 
+- **Dataset**: `ds_csv_dynamic` → `p_container = source`, `p_folder = trigger`, `p_file = locations.csv`
+- **Timeout**: `0.12:00:00` (12 hours)
+- **Sleep**: `10` (seconds between existence checks)
+While debugging, this activity keeps re-checking the `trigger` folder for `locations.csv`. Once that file is uploaded, the activity succeeds and the pipeline moves forward. This is effectively a manual, polling-based stand-in for a Storage Event trigger — the timeout/sleep can also be tuned or scheduled for a specific window (e.g. 12 PM–4 PM) so the pipeline only fires once per upload during business hours.
+ 
+---
+ 
+## Step 2: `Get Metadata`
+ 
+Lists every file sitting in the folder that needs routing.
+ 
+- **Dataset**: `ds_meta` (Azure Data Lake Gen2, CSV) → file path set to `source/files`, "First row as header" checked
+- **Field list**: `childItems`
+- **Depends on**: `Validate` (Succeeded)
+`childItems` comes back as an array of objects, one per file:
+```json
+[
+  { "name": "customers.csv", "type": "File" },
+  { "name": "drivers.csv",   "type": "File" },
+  { "name": "trips.csv",     "type": "File" }
+]
+```
+ 
+---
+ 
+## Step 3: `ForEachFile` (ForEach) → `SwitchFile` (Switch)
+ 
+- **Items**: `@activity('Get Metadata').output.childItems` — iterates once per file found above
+- Inside the loop, a **Switch** activity (`SwitchFile`) decides which Copy activity to run:
+  - **On**: `@split(item().name,'.')[0]` — strips the extension off the current file's name (e.g. `customers.csv` → `customers`)
+  - **Cases**:
+| Case value | Activity | Sink folder |
+|---|---|---|
+| `customers` | `Copy Customers` | `sink/customers/` |
+| `drivers` | `Copy Drivers` | `sink/drivers/` |
+| `trips` | `Copy Trips` | `sink/trips/` |
+| *(Default)* | — (empty) | file is silently skipped |
+ 
+Each Copy activity uses the same **dynamic dataset** (`ds_csv_dynamic`) on both source and sink, driven by three dataset parameters — `p_container`, `p_folder`, `p_file` — instead of needing a separate hardcoded dataset per file type:
+ 
+- **Source**: `p_container = source`, `p_folder = files`, `p_file = @item().name`
+- **Sink**: `p_container = sink`, `p_folder = customers` / `drivers` / `trips` (matching the case), `p_file = @item().name`
+This is what lets one dataset + one Copy-activity pattern serve all three file types — only the sink's `p_folder` value changes per case.
+ 
+---
+ 
+## Step 4: `Delete`
+ 
+- **Depends on**: `ForEachFile` (Succeeded)
+- **Dataset**: `ds_csv_dynamic` → `p_container = source`, `p_folder = trigger`, `p_file = locations.csv`
+- **Enable logging**: unchecked (off)
+Removes the flag file from the `trigger` folder once routing is complete, so the pipeline is ready to detect the *next* upload rather than re-triggering on the same file.
+ 
+---
+ 
+## End-to-end flow
+ 
+1. Someone uploads `customers.csv`, `drivers.csv`, `trips.csv` into `source/files/`.
+2. Someone (or an upstream process) uploads `locations.csv` into `source/trigger/` — this is the signal that files are ready.
+3. `Validate` detects `locations.csv` and lets the pipeline proceed.
+4. `Get Metadata` lists everything in `source/files/`.
+5. `ForEachFile` + `SwitchFile` routes each file to its matching destination folder based on filename.
+6. `Delete` removes `locations.csv` from `trigger/`, resetting for the next run.
+---
+ 
+## Notes / Things to double-check
+ 
+- **Case values are case- and spelling-sensitive.** `SwitchFile` matches on the exact string produced by `split(item().name,'.')[0]`. If a source file is actually named `customer.csv` (singular) but the switch case is `customers` (plural), it won't match — it silently falls into the empty **Default** case and never gets copied, with no error or alert raised. Worth confirming the real file-naming convention in `source/files/` matches the case values exactly (`customers`, `drivers`, `trips`).
+- **Unmatched files are silent.** Since Default has no activities, any file that doesn't match one of the three cases is simply skipped with no logging or notification. Consider adding a Default action (e.g. logging the unmatched filename, or a failure/alert branch) if unexpected files showing up in `source/files/` should be visible.
+- **This is a polling design, not an event-driven one.** The `Validate` activity's `sleep`/`timeout` control how promptly and how long it waits for the flag file — tune these (or run the pipeline on a schedule/window) based on how quickly routing needs to happen after upload.
+- **Storage Event triggers were intentionally avoided** here due to cost and subscription-tier availability; if that changes, replacing `Validate` with a native Storage Event trigger on `source/trigger/` would remove the polling overhead entirely.
