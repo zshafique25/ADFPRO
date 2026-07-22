@@ -1981,8 +1981,7 @@
 						"defaultValue": "Orders"
 					},
 					"backdate": {
-						"type": "string",
-						"defaultValue": "''"
+						"type": "string"
 					}
 				},
 				"annotations": [],
