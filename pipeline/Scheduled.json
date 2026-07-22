@@ -54,7 +54,7 @@
 				"typeProperties": {
 					"method": "POST",
 					"url": {
-						"value": "alertsurl",
+						"value": "@pipeline().parameters.alertsUrl",
 						"type": "Expression"
 					},
 					"body": {
@@ -76,6 +76,9 @@
 			"backdate": {
 				"type": "string",
 				"defaultValue": "''"
+			},
+			"alertsUrl": {
+				"type": "string"
 			}
 		},
 		"annotations": [],
