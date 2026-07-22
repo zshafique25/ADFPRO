@@ -1,6 +1,6 @@
-# ADFPRO
+# Azure Data Factory - Pipelines
 
-# CDC Ingestion Pipeline — Azure Data Factory
+# 1. CDC Ingestion Pipeline — Azure Data Factory
  
 Incremental (CDC-style) load of SQL tables into ADLS Gen2 Parquet, orchestrated by two ADF pipelines and backed by a Logic App for failure alerts.
  
@@ -105,7 +105,7 @@ To re-process data from an arbitrary date without disturbing the checkpoint, tri
 
 ---
 
-# REST API Ingestion — PokeAPI, Two Pagination Strategies
+# 2. REST API Ingestion — PokeAPI, Two Pagination Strategies
  
 Two ADF pipelines that pull the full Pokémon list from the public [PokeAPI](https://pokeapi.co/api/v2/pokemon) into ADLS Gen2 as JSON. Both do the same job end-to-end but paginate through the API differently — one follows the API's own "next page" link, the other computes offsets itself. Which one to use depends entirely on whether the API you're integrating with hands you a next-page URL or not.
  
@@ -190,7 +190,7 @@ Use this approach when the API does **not** return a next-page URL, so you have 
 - Pagination behavior is API-specific — always check the target API's docs to see whether it returns a next-page link (`AbsoluteUrl`) or expects the caller to compute paging (`offset`/`limit`, `page`, cursor tokens, etc.) before picking a rule.
 ---
 
-# Router Pipeline — Route Files to Destination Folders by Filename
+# 3. Router Pipeline — Route Files to Destination Folders by Filename
  
 Watches for a small "flag" file, then scans a source folder and routes every file it finds into the correct destination folder based on the file's name (e.g. `customers.csv` → `sink/customers/`, `drivers.csv` → `sink/drivers/`, `trips.csv` → `sink/trips/`). Built as a lightweight alternative to a Storage Event trigger.
  
@@ -287,7 +287,7 @@ Removes the flag file from the `trigger` folder once routing is complete, so the
 - **Storage Event triggers were intentionally avoided** here due to cost and subscription-tier availability; if that changes, replacing `Validate` with a native Storage Event trigger on `source/trigger/` would remove the polling overhead entirely.
 ---
 
-# Schema Pipeline — Dynamic Column Mapping in ADF
+# 4. Schema Pipeline — Dynamic Column Mapping in ADF
  
 Copies every file from a source folder to a destination folder using **one** Copy activity, while applying a **different column mapping (translator) per file** — `customers.csv` gets the customers mapping, `drivers.csv` gets the drivers mapping, `trips.csv` gets the trips mapping — instead of needing a separate Copy activity per file type.
  
@@ -356,4 +356,132 @@ Both avoid needing a new pipeline parameter and a new `if(equals(...))` branch e
 ## Notes / Things to double-check
 - The `if/equals` chain matches on **exact filename**, including extension (`'customers.csv'`, `'drivers.csv'`) — case-sensitive and extension-sensitive. Any filename that doesn't match either of the first two conditions silently falls through to `trips_schema`, so an unexpected file (e.g. a typo'd name or a 4th file type accidentally dropped into `source/files/`) would get copied using the wrong mapping rather than failing loudly.
 - All three schemas currently keep source and sink column names identical (straight pass-through mapping with type conversion allowed and truncation permitted) — if any target table needs renamed or reordered columns, that's where the mapping objects would need actual source→sink differences rather than 1:1 copies.
+---
+
+# 5. Deltalake Pipeline — Upsert into Delta Lake (Silver Layer)
+ 
+Reads a CSV, applies a couple of light transformations, and **upserts** (insert new + update existing) the result into a Delta Lake table — keyed on `location_id`. Built with a Mapping Data Flow rather than a plain Copy activity, since Delta merge/upsert logic needs the data flow engine (Copy activities can only append/overwrite, not merge on a key).
+ 
+## Why Data Flow instead of Copy Data
+ 
+| | Use for |
+|---|---|
+| **Copy Data** | Moving data from source into the **bronze** layer — straight land-as-is copies |
+| **Data Flow** | Moving data from **bronze into silver/gold** — anything needing transformations, upserts, or Delta merge logic |
+ 
+Upserts specifically require Data Flow: it's low-code/no-code on the surface, but runs as generated Spark under the hood, which is what makes key-based merge (update-if-matched, insert-if-not) possible.
+ 
+## Architecture
+ 
+```
+Deltalake (pipeline)
+  └─ Data flow (ExecuteDataFlow) ──▶ deltaflow (Mapping Data Flow)
+                                       source → UpperState → selectCols → alterRow → sinkDelta
+```
+ 
+---
+ 
+## Pipeline: `Deltalake`
+ 
+One activity: **`Data flow`** (Execute Data Flow), pointing at the `deltaflow` Mapping Data Flow.
+
+<img width="315" height="171" alt="Deltalake" src="https://github.com/user-attachments/assets/5ee86afd-02cc-4ca6-9916-41b9f9b95804" />
+ 
+**Dataset parameters passed to the data flow's `source`:**
+| Parameter | Value |
+|---|---|
+| `p_container` | `source` |
+| `p_folder` | `Deltasource` |
+| `p_file` | `locations.csv` |
+ 
+**Compute**: `coreCount: 8`, `computeType: General` (per notes: use **Small** compute size for this workload)
+**Trace level**: `None` (matches "Logging level: None" from notes)
+**Cache sinks**: `firstRowOnly: true`
+
+---
+ 
+## Data Flow: `deltaflow`
+
+<img width="1741" height="197" alt="Deltaflow" src="https://github.com/user-attachments/assets/14391b2d-0905-45a8-b564-b88c5cea6746" />
+
+### 1. `source`
+Reads `ds_csv_dynamic` with an explicit projection:
+ 
+| Column | Type |
+|---|---|
+| `location_id` | short |
+| `city` | string |
+| `state` | string |
+| `country` | string |
+| `latitude` | double |
+| `longitude` | double |
+| `last_updated_timestamp` | timestamp |
+ 
+Settings: `allowSchemaDrift: true` (lets the CSV's schema evolve over time without breaking the flow), `validateSchema: false` (only worth turning on if the schema is guaranteed never to change), `ignoreNoFilesFound: false`.
+ 
+### 2. `UpperState` (Derived Column)
+```
+state = upper(state)
+```
+Normalizes the `state` column to uppercase.
+ 
+### 3. `selectCols` (Select)
+Maps forward only: `location_id`, `city`, `state`, `country`, `last_updated_timestamp` — **`latitude` and `longitude` are dropped here** and don't reach the sink.
+ 
+### 4. `alterRow` (Alter Row)
+```
+upsertIf(1==1)
+```
+Marks every row as an upsert candidate (the `1==1` condition is always true, so this applies to 100% of incoming rows — no rows are filtered out at this stage).
+ 
+### 5. `sinkDelta` (Sink)
+- **Type**: Inline dataset, format `delta`
+- **Linked service**: `ls_datalake`
+- **Path**: `sink/deltasink`
+- **Row policies**: `insertable: true`, `upsertable: true`, `updateable: false`, `deletable: false` — new rows are inserted and existing rows matching the merge key are upserted; a separate/plain "update" and "delete" are not enabled
+- **Merge key**: `location_id` — this is what determines whether an incoming row is treated as a new insert or an update to an existing row
+- **Other settings**: `mergeSchema: false`, `autoCompact: false`, `optimizedWrite: false`, `vacuum: 0`, no compression
+---
+ 
+## Upsert logic, visually
+ 
+```
+Existing table:        Incoming write:        Result:
+  1, 2, 3        +        1, 2, 4, 5      =    1 (updated), 2 (updated), 3 (untouched), 4 (inserted), 5 (inserted)
+```
+Rows whose `location_id` already exists get updated in place; rows with a new `location_id` get inserted; rows not present in the incoming batch are left alone.
+ 
+---
+ 
+## How this was built (repeatable process)
+ 
+1. Create folder `source/Deltasource` and upload `locations.csv`.
+2. Create pipeline `Deltalake`, drag in a **Data flow** activity, settings → `+New` → build/name the data flow `deltaflow`.
+3. In the data flow: **Add Source** → name `source` → source type: dataset → `ds_csv_dynamic`.
+4. Turn on **Data Flow Debug** (spins up a live cluster) to preview data as you build.
+5. In source **debug settings → parameters**, set `p_container = source`, `p_folder = Deltasource`, `p_file = locations.csv` so previews reflect the real file.
+6. Review source options:
+   - **Allow schema drift** — lets future columns show up without breaking the flow
+   - **Validate schema** — only if the schema is guaranteed stable
+   - **Skip line count** — to skip header/junk rows if needed
+   - **Sampling** — pull a small sample for faster iteration while building/debugging
+7. Add a **Derived Column** transformation named `UpperState`: column `state`, expression `upper(state)`. Refresh Data Preview to confirm.
+8. Add a **Select** transformation named `selectCols`: remove `latitude` and `longitude`. Refresh Data Preview.
+9. Add an **Alter Row** transformation named `alterRow`: condition `Upsert if` → `1==1` (passes all rows through as upsert candidates).
+10. Add a **Sink** named `sinkDelta`:
+    - Sink type: Inline, dataset type: Delta
+    - Linked service: `ls_datalake`
+    - File path: `sink/deltasink`
+    - No compression, vacuum: 0
+    - Enable **Allow upsert**, set merge **key column**: `location_id`
+11. Refresh Data Preview once more to confirm the end-to-end result, then **turn off the data flow debug cluster** and save (leaving debug on burns compute unnecessarily).
+12. Back in the `Deltalake` pipeline, set the Execute Data Flow activity's parameter values, **Compute size: Small**, **Logging level: None**, then **Debug → Use activity runtime**.
+13. Once it runs successfully, save, open a Pull Request, and merge into the `master` branch.
+14. On the `master` branch in ADF, the pipeline is already present from the merge — click **Publish**.
+## Notes / Things to double-check
+- **Update and delete are off at the sink** (`updateable: false`, `deletable: false`) even though `alterRow` marks every row as an upsert candidate. This is expected for a pure insert-or-update-on-match upsert pattern (upsert covers both the "new row" and "matching row changed" cases together), but if a genuine separate "update-only" or "delete" scenario is ever needed, those flags would need to be enabled explicitly.
+- **`mergeSchema: false`** means if the source CSV picks up new columns in the future (allowed via schema drift on the source), those new columns won't automatically propagate into the Delta table structure — they'd need `mergeSchema: true` or a manual schema update to land in the sink.
+- **`vacuum: 0`** means no automatic cleanup of old Delta file versions is happening — worth revisiting if storage/versioning cost becomes a concern over time.
+- The merge key is `location_id` alone — make sure this is genuinely unique per real-world location in the source data; a non-unique key here would cause updates to apply non-deterministically across matching rows.
+  
 ---
