@@ -118,6 +118,7 @@ Both pipelines follow the same two-activity shape:
 ```
 Endpoint (Web)  ──▶  CopyAllData (Copy)
 ```
+<img width="625" height="162" alt="REST API absoluteurl" src="https://github.com/user-attachments/assets/a25ae9d0-f63d-4566-860f-f6c38d1db5d4" />
  
 1. **`Endpoint`** (Web Activity) — `GET https://pokeapi.co/api/v2/pokemon`. Used purely to probe the API once (e.g. to read `count`) before the paginated Copy activity runs.
 2. **`CopyAllData`** (Copy Activity) — `RestSource` → `JsonSink`, with a **pagination rule** that tells ADF how to fetch every subsequent page automatically. This rule is the only thing that differs between the two pipelines.
