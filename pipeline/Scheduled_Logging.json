@@ -54,7 +54,7 @@
 				"typeProperties": {
 					"method": "POST",
 					"url": {
-						"value": "https://prod-12.centralindia.logic.azure.com:443/workflows/c5d6dcdfe18448ba94cec8e1a50e82f4/triggers/When_an_HTTP_request_is_received/paths/invoke?api-version=2016-10-01&sp=%2Ftriggers%2FWhen_an_HTTP_request_is_received%2Frun&sv=1.0&sig=2agvdsjRVPBe02h-bCqEiEWa3J9eOPKX1lqSvo8GUss",
+						"value": "@pipeline().parameters.alertsUrl",
 						"type": "Expression"
 					},
 					"body": {
