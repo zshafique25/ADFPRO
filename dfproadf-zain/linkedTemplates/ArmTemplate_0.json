@@ -1958,7 +1958,7 @@
 							"method": "POST",
 							"headers": {},
 							"url": {
-								"value": "alertsurl",
+								"value": "@pipeline().parameters.alertsUrl",
 								"type": "Expression"
 							},
 							"body": {
@@ -1981,6 +1981,9 @@
 						"defaultValue": "Orders"
 					},
 					"backdate": {
+						"type": "string"
+					},
+					"alertsUrl": {
 						"type": "string"
 					}
 				},
