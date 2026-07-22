@@ -102,7 +102,8 @@ When an HTTP request is received  ──▶  Send an email (V2)
 ## Recovery / Backfill Runs
  
 To re-process data from an arbitrary date without disturbing the checkpoint, trigger `Scheduled` (or `Ingestion` directly) manually with `backdate` set to the desired date (e.g. `2025-01-01`). `cdc.json` is only updated by the `change_cdc` activity, so backfills never overwrite the running checkpoint.
- 
+
+---
 
 # REST API Ingestion — PokeAPI, Two Pagination Strategies
  
@@ -187,6 +188,7 @@ Use this approach when the API does **not** return a next-page URL, so you have 
 - The offset approach depends on knowing the total item count (`count`) up front from a single probe call (`Endpoint`) — if the API doesn't expose a total count either, the range would need a hardcoded or otherwise-derived upper bound.
 - This is a manual/on-demand pull (not scheduled) and pulls the full dataset from scratch each run — it does **not** implement incremental/CDC-style loading. For very large or frequently-changing datasets (millions of rows), a real-time/incremental design is more appropriate; this pattern is meant for pulling a full reference/lookup dataset such as a paginated public API listing.
 - Pagination behavior is API-specific — always check the target API's docs to see whether it returns a next-page link (`AbsoluteUrl`) or expects the caller to compute paging (`offset`/`limit`, `page`, cursor tokens, etc.) before picking a rule.
+---
 
 # Router Pipeline — Route Files to Destination Folders by Filename
  
@@ -283,3 +285,75 @@ Removes the flag file from the `trigger` folder once routing is complete, so the
 - **Unmatched files are silent.** Since Default has no activities, any file that doesn't match one of the three cases is simply skipped with no logging or notification. Consider adding a Default action (e.g. logging the unmatched filename, or a failure/alert branch) if unexpected files showing up in `source/files/` should be visible.
 - **This is a polling design, not an event-driven one.** The `Validate` activity's `sleep`/`timeout` control how promptly and how long it waits for the flag file — tune these (or run the pipeline on a schedule/window) based on how quickly routing needs to happen after upload.
 - **Storage Event triggers were intentionally avoided** here due to cost and subscription-tier availability; if that changes, replacing `Validate` with a native Storage Event trigger on `source/trigger/` would remove the polling overhead entirely.
+---
+
+# Schema Pipeline — Dynamic Column Mapping in ADF
+ 
+Copies every file from a source folder to a destination folder using **one** Copy activity, while applying a **different column mapping (translator) per file** — `customers.csv` gets the customers mapping, `drivers.csv` gets the drivers mapping, `trips.csv` gets the trips mapping — instead of needing a separate Copy activity per file type.
+ 
+## Why this exists
+A single dynamic dataset (`ds_csv_dynamic` + a `ForEach` over the source folder) already lets one Copy activity move any file by filename. The remaining problem is **schema**: each file has different columns, so the mapping ("translator") can't be hardcoded — it has to be picked dynamically based on which file is currently being copied. This pipeline solves that by storing each file's mapping as a **pipeline parameter** and picking the right one at runtime with an `if/equals` expression.
+ 
+## Architecture
+ 
+```
+Get Metadata ──▶ ForEachFile
+                     └─ Data Load (Copy, translator picked per-file)
+```
+ 
+- **`Get Metadata`** — dataset `ds_meta`, field list `childItems`, lists every file in `source/files/`.
+- **`ForEachFile`** — iterates `@activity('Get Metadata').output.childItems`; inside, a single Copy activity (`Data Load`) handles every file.
+<img width="640" height="365" alt="Schema" src="https://github.com/user-attachments/assets/1a7419ce-3aaa-4127-87ae-f9bb9bb27343" />
+
+---
+ 
+## Pipeline parameters — one schema per file
+ 
+Three parameters hold the actual column mappings, each pasted in as a full `TabularTranslator` JSON object:
+ 
+| Parameter | Type | Holds |
+|---|---|---|
+| `customers_schema` | object | Mapping for `customers.csv` (`customer_id`, `first_name`, `last_name`, `email`, `phone_number`, `city`, `signup_date`, `last_updated_timestamp`) |
+| `drivers_schema` | object | Mapping for `drivers.csv` (`driver_id`, `first_name`, `last_name`, `phone_number`, `vehicle_id`, `driver_rating`, `city`, `last_updated_timestamp`) |
+| `trips_schema` | object | Mapping for `trips.csv` (`trip_id`, `driver_id`, `customer_id`, `vehicle_id`, `trip_start_time`, `trip_end_time`, `start_location`, `end_location`, `distance_km`, `fare_amount`, `payment_method`, `trip_status`, `last_updated_timestamp`) |
+ 
+Each default value is a full source→sink column mapping (kept 1:1, same names/types — the point here is dynamic *selection* of mappings, not transformation).
+ 
+## `Data Load` (Copy Activity)
+ 
+**Source** (`ds_csv_dynamic`): `p_container = source`, `p_folder = files`, `p_file = @item().name`
+**Sink** (`ds_csv_dynamic`): `p_container = sink`, `p_folder = schema`, `p_file = @item().name`
+ 
+**Translator** — instead of a static mapping, this is an expression that switches on the current file's name:
+```
+@if(equals(item().name,'customers.csv'), pipeline().parameters.customers_schema,
+    if(equals(item().name,'drivers.csv'), pipeline().parameters.drivers_schema,
+        pipeline().parameters.trips_schema))
+```
+For each file the loop hits, this resolves to exactly one of the three parameter objects and ADF applies that mapping for the copy. Since `trips_schema` is the final `else`, any file that isn't `customers.csv` or `drivers.csv` falls through to the trips mapping by default.
+ 
+---
+ 
+## How this was built (repeatable process)
+ 
+1. **Get one mapping working manually first.** Build a throwaway Copy activity with source = `customers.csv` (hardcoded `p_file`), sink = `schema/customers.csv`, then in **Mapping → Import schemas** let ADF infer the column list — this is the fastest way to get a correct mapping without typing it by hand.
+2. **Grab the generated code.** Open the Copy activity's **Code** view and copy everything from `"translator"` onward (the mapping JSON ADF just built for you).
+3. **Delete the throwaway Copy activity** — it was only there to generate the mapping code.
+4. **Repeat step 1–2 for each file** (`drivers.csv`, `trips.csv`) to get all three mapping blocks.
+5. **Create the pipeline parameters.** In the pipeline's Parameters tab, add `customers_schema`, `drivers_schema`, `trips_schema` (all type `object`), and paste each file's generated mapping JSON in as that parameter's default value.
+6. **Build the real dynamic pipeline**: `Get Metadata` (dataset `ds_meta`, field list `childItems`) → `ForEachFile` (Items = child items) → inside, one Copy activity (`Data Load`) using the dynamic dataset for source/sink.
+7. **Set the translator as an expression** (not a static mapping) using the `if(equals(...))` chain above, referencing the three parameters.
+8. Debug, confirm all three files land in `sink/schema/` with the correct columns, then publish.
+---
+ 
+## Scaling beyond 3 file types
+ 
+Hardcoding one pipeline parameter per file type works fine for a handful of schemas, but doesn't scale to, say, 100 file types. For that case, consider instead:
+- Storing all mappings as one JSON array/config file (e.g. `{ "customers.csv": {...}, "drivers.csv": {...}, ... }`) and looking up the right mapping by filename via a `Lookup` activity, or
+- Storing the mapping definitions in a SQL table (one row per file type) and driving the translator lookup from a query, rather than a hardcoded `if/equals` chain per file.
+Both avoid needing a new pipeline parameter and a new `if(equals(...))` branch every time a new file type is added.
+ 
+## Notes / Things to double-check
+- The `if/equals` chain matches on **exact filename**, including extension (`'customers.csv'`, `'drivers.csv'`) — case-sensitive and extension-sensitive. Any filename that doesn't match either of the first two conditions silently falls through to `trips_schema`, so an unexpected file (e.g. a typo'd name or a 4th file type accidentally dropped into `source/files/`) would get copied using the wrong mapping rather than failing loudly.
+- All three schemas currently keep source and sink column names identical (straight pass-through mapping with type conversion allowed and truncation permitted) — if any target table needs renamed or reordered columns, that's where the mapping objects would need actual source→sink differences rather than 1:1 copies.
+---
