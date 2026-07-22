@@ -485,3 +485,203 @@ Rows whose `location_id` already exists get updated in place; rows with a new `l
 - The merge key is `location_id` alone — make sure this is genuinely unique per real-world location in the source data; a non-unique key here would cause updates to apply non-deterministically across matching rows.
   
 ---
+
+# 6. Ingestion_Logging & Scheduled_Logging — CDC Load with DB-Based Run Logging
+ 
+Evolution of the original `Ingestion`/`Scheduled` pipelines: the JSON-file checkpoint (`cdc.json`) is replaced with a proper **SQL log table** (`source.pipeline_run_log`). Every run — successful, no-op, or failed — writes a row, giving full history, correct per-table/schema scoping, and a queryable audit trail instead of a single overwritten blob file.
+ 
+## Architecture
+ 
+```
+Scheduled_Logging (daily trigger)
+  └─ Execute Pipeline 2 ──▶ Ingestion_Logging
+        ├─ On Success: done
+        └─ On Failure ─┬─▶ Alerts (Web → Logic App email)
+                        └─▶ LogFailure (marks the run row Failed)
+ 
+Ingestion_Logging:
+  last_cdc ──▶ LogStart ──▶ Totalresults ──▶ If New Rows
+                                                 ├─ True  ─▶ Load ─▶ LogSuccess
+                                                 └─ False ─▶ LogNoOp
+```
+ 
+---
+ 
+## SQL tables schema 
+
+```sql
+CREATE schema source;
+
+CREATE TABLE Orders (
+    order_id INT PRIMARY KEY,
+    customer_name VARCHAR(100),
+    product_name VARCHAR(100),
+    quantity INT,
+    price DECIMAL(10,2),
+    order_date DATETIME,
+    last_updated DATETIME DEFAULT GETDATE()
+);
+
+
+-- INITIAL
+INSERT INTO Orders (order_id, customer_name, product_name, quantity, price, order_date, last_updated)
+VALUES
+(1, 'John Doe', 'Laptop', 1, 1200.00, '2025-09-20', '2025-09-20 10:15:00'),
+(2, 'Alice Smith', 'Phone', 2, 800.00, '2025-09-21', '2025-09-21 14:30:00'),
+(3, 'Bob Johnson', 'Headphones', 3, 150.00, '2025-09-22', '2025-09-22 09:45:00'),
+(4, 'Charlie Brown', 'Monitor', 1, 300.00, '2025-09-22', '2025-09-22 18:10:00'),
+(5, 'Diana Prince', 'Keyboard', 2, 100.00, '2025-09-23', '2025-09-23 11:20:00'),
+(6, 'Ethan Hunt', 'Mouse', 5, 50.00, '2025-09-23', '2025-09-23 16:40:00'),
+(7, 'Fiona Adams', 'Printer', 1, 200.00, '2025-09-24', '2025-09-24 09:05:00'),
+(8, 'George Wilson', 'Tablet', 2, 450.00, '2025-09-24', '2025-09-24 13:25:00'),
+(9, 'Hannah Lee', 'Smartwatch', 1, 220.00, '2025-09-25', '2025-09-25 08:50:00'),
+(10, 'Ian Carter', 'Camera', 1, 900.00, '2025-09-25', '2025-09-25 15:15:00');
+
+
+-- INCREMENTAL
+INSERT INTO Orders (order_id, customer_name, product_name, quantity, price, order_date, last_updated)
+VALUES
+(11, 'Jack Miller', 'Drone', 1, 1500.00, '2025-09-26', '2025-09-26 10:00:00'),
+(12, 'Kelly Green', 'Speakers', 2, 180.00, '2025-09-26', '2025-09-26 14:45:00'),
+(13, 'Liam Scott', 'Charger', 3, 25.00, '2025-09-27', '2025-09-27 09:30:00'),
+(14, 'Mia Turner', 'Desk Lamp', 1, 60.00, '2025-09-27', '2025-09-27 12:20:00'),
+(15, 'Noah Brooks', 'Gaming Chair', 1, 350.00, '2025-09-27', '2025-09-27 18:10:00');
+
+-- Logging Table
+CREATE TABLE source.pipeline_run_log (
+    log_id            INT IDENTITY(1,1) PRIMARY KEY,
+    pipeline_name     VARCHAR(200) NOT NULL,
+    run_id            VARCHAR(100) NOT NULL,
+    schema_name       VARCHAR(100) NOT NULL,
+    table_name        VARCHAR(100) NOT NULL,
+    start_time        DATETIME2 NOT NULL,
+    end_time          DATETIME2 NULL,
+    status            VARCHAR(20) NOT NULL,      -- 'Started' / 'Succeeded' / 'Failed'
+    cdc_timestamp     DATETIME2 NULL,             -- checkpoint used going INTO this run
+    new_cdc_timestamp DATETIME2 NULL,             -- checkpoint coming OUT of this run
+    rows_processed    INT NULL,
+    error_message     VARCHAR(MAX) NULL
+);
+
+-- Index
+CREATE INDEX ix_pipeline_run_log_lookup
+    ON source.pipeline_run_log (table_name, schema_name, status);
+
+
+-- INCREMENTAL
+INSERT INTO Orders (order_id, customer_name, product_name, quantity, price, order_date, last_updated)
+VALUES
+(16, 'Jack Miller', 'Drone', 1, 1500.00, '2025-09-26', '2025-09-28 10:00:00'),
+(17, 'Kelly Green', 'Speakers', 2, 180.00, '2025-09-26', '2025-09-29 14:45:00'),
+(18, 'Liam Scott', 'Charger', 3, 25.00, '2025-09-27', '2025-09-30 09:30:00'),
+(19, 'Mia Turner', 'Desk Lamp', 1, 60.00, '2025-09-27', '2025-09-30 12:20:00'),
+(20, 'Noah Brooks', 'Gaming Chair', 1, 350.00, '2025-09-27', '2025-09-30 18:10:00');
+```
+ 
+Every run gets exactly one row, inserted at the start and updated (never re-inserted) as the run progresses through its outcome.
+ 
+---
+ 
+## Pipeline: `Ingestion_Logging`
+ 
+| Parameter | Default | Purpose |
+|---|---|---|
+| `schema` | `source` | target schema |
+| `table` | `Orders` | target table |
+| `backdate` | `2025-09-26` | manual override date; blank = trust the log table's checkpoint |
+
+<img width="1435" height="492" alt="Ingestion Logging" src="https://github.com/user-attachments/assets/f60042d6-5a81-4e82-931b-5b6c3f7fcb6e" />
+ 
+### 1. `last_cdc` (Lookup, `ls_database`/`ds_database`)
+```sql
+SELECT COALESCE(MAX(new_cdc_timestamp), '1900-01-01') as cdc_timestamp
+FROM source.pipeline_run_log
+WHERE table_name = '@{pipeline().parameters.table}'
+  AND schema_name = '@{pipeline().parameters.schema}'
+  AND status = 'Succeeded'
+```
+`firstRowOnly: true`. The `COALESCE` is what makes this self-seeding: a brand-new table with **no** successful run history yet gets `1900-01-01` automatically — no manual seed row needed in the log table before a table's first run.
+ 
+### 2. `LogStart` (Script)
+Inserts a `Started` row immediately, capturing which checkpoint this run is using:
+```sql
+INSERT INTO source.pipeline_run_log (pipeline_name, run_id, schema_name, table_name, start_time, status, cdc_timestamp)
+VALUES ('@{pipeline().Pipeline}', '@{pipeline().RunId}', '@{pipeline().parameters.schema}', '@{pipeline().parameters.table}',
+        SYSUTCDATETIME(), 'Started',
+        '@{if(empty(pipeline().parameters.backdate), activity('last_cdc').output.firstRow.cdc_timestamp, pipeline().parameters.backdate)}')
+```
+Every attempt gets a row here, whether it later succeeds or fails — that's what makes this a true audit log rather than just a checkpoint.
+ 
+### 3. `Totalresults` (Script)
+Counts rows changed since the checkpoint — same logic as before, just now reading `activity('last_cdc').output.firstRow.cdc_timestamp` instead of a file-based lookup.
+ 
+### 4. `If New Rows` (If Condition)
+`@greater(activity('Totalresults').output.resultSets[0].rows[0].total_count, 0)`
+ 
+- **True** → `Load` (Copy, unchanged — SQL → Parquet) → `LogSuccess` (Script):
+```sql
+  UPDATE source.pipeline_run_log
+  SET status = 'Succeeded', end_time = SYSUTCDATETIME(),
+      new_cdc_timestamp = (SELECT MAX(last_updated) FROM @{schema}.@{table}),
+      rows_processed = @{activity('Totalresults').output.resultSets[0].rows[0].total_count}
+  WHERE run_id = '@{pipeline().RunId}'
+```
+  Replaces the old `maxCDC` + `change_cdc` two-activity JSON-write with a single `UPDATE` — the new high-water mark is computed and stored in one round trip.
+ 
+- **False** → `LogNoOp` (Script): closes the row out as `Succeeded` with `rows_processed = 0` and the checkpoint held steady (no new data means no advance) — so the next run's `last_cdc` lookup still finds a valid `Succeeded` row to build on.
+---
+ 
+## Pipeline: `Scheduled_Logging`
+ 
+| Parameter | Default | Purpose |
+|---|---|---|
+| `schema` | `source` | forwarded to `Ingestion_Logging` |
+| `table` | `Orders` | forwarded to `Ingestion_Logging` |
+| `backdate` | *(none)* | forwarded; leave blank for scheduled runs, set only for manual recovery |
+| `alertsUrl` | *(none)* | Logic App trigger URL, supplied at trigger/deployment time — never hardcoded |
+
+<img width="632" height="347" alt="Scheduled Logging" src="https://github.com/user-attachments/assets/4cc6da0b-ae83-491b-bde4-61ba170d9bf2" />
+
+1. **`Execute Pipeline 2`** → `Ingestion_Logging`, forwards all three parameters.
+2. **`Alerts`** (Web, fires on `Execute Pipeline 2` **Failed**) — POSTs `pipeline_name`/`run_id` to `@pipeline().parameters.alertsUrl`. `secureInput: true` masks the resolved URL in run history.
+3. **`LogFailure`** (Script, fires on `Execute Pipeline 2` **Failed**, in parallel with `Alerts` — not chained after it):
+```sql
+   UPDATE source.pipeline_run_log
+   SET status = 'Failed', end_time = SYSUTCDATETIME(),
+       error_message = '@{activity('Execute Pipeline 2').Error.Message}'
+   WHERE run_id = '@{activity('Execute Pipeline 2').output.pipelineRunId}'
+```
+   Matches back to the exact log row `LogStart` created inside the failed child run, via `pipelineRunId`. Running this **parallel to `Alerts`, not dependent on it succeeding**, was a deliberate fix — if it depended on `Alerts` succeeding, a broken alert URL or a Logic App outage would leave the log row stuck at `Started` forever, silently breaking the whole audit trail for that run.
+ 
+---
+ 
+## Debugging notes / lessons learned building this
+ 
+Two real bugs surfaced during testing, both worth remembering if this pattern gets reused elsewhere:
+ 
+1. **Lookup output shape depends on `firstRowOnly`.** With `firstRowOnly: true`, the Lookup's output is `{ firstRow: {...} }` — **not** `{ value: [...] }`. Every downstream expression needs `activity('last_cdc').output.firstRow.cdc_timestamp`, not the array-style `.value[0].cdc_timestamp` used with `firstRowOnly: false`. Mixing the two throws `InvalidTemplate: property 'value' doesn't exist`.
+2. **A failure-logging activity must not depend on the alert succeeding.** Chaining `LogFailure` after `Alerts` (Succeeded) means any hiccup in the alert delivery silently prevents the run from ever being marked `Failed`. `LogFailure` and `Alerts` need to be two independent branches off the same `Failed` condition.
+---
+ 
+## Verified behavior (from test runs)
+ 
+A query against `source.pipeline_run_log` after several debug runs confirmed the full range of expected states:
+ 
+| Scenario | Result |
+|---|---|
+| First-ever run, no prior log history | `cdc_timestamp` seeded to `1900-01-01` automatically via `COALESCE`, full table loaded, row closed `Succeeded` |
+| Subsequent run, new rows present | Checkpoint correctly picked up from prior `Succeeded` row, only delta rows loaded, `rows_processed` populated |
+| Run with no new data | `LogNoOp` path taken, `rows_processed = 0`, checkpoint held steady |
+| Forced failure | Row closed out as `Failed` with a populated `error_message`, independent of whether the alert email itself succeeded |
+ 
+```sql
+SELECT * FROM source.pipeline_run_log ORDER BY log_id DESC;
+```
+is the standard way to review pipeline health going forward — no more digging through ADLS for a JSON checkpoint file or cross-referencing ADF's run history separately.
+
+<img width="1662" height="511" alt="results" src="https://github.com/user-attachments/assets/f2c6e069-41a0-4c25-8882-b3c91d513eeb" />
+ 
+## Notes / Things to double-check
+- `Scheduled_Logging`'s `backdate` and `alertsUrl` parameters have **no default value** at all (rather than an explicit empty string). Confirm this behaves as expected on an unattended scheduled trigger run — if ADF requires an explicit value for parameters with no default on trigger-based execution, the trigger definition itself needs to pass `backdate: ""` and the real `alertsUrl` explicitly rather than relying on an implicit default.
+
+---
